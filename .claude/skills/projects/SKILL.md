@@ -59,9 +59,41 @@ else
   DIRTY="-"
 fi
 
-# Always go to GitHub for PRs / issues (project of record)
-PRS=$(gh -R {repo} pr list --state open --json number --jq 'length')
-ISSUES=$(gh -R {repo} issue list --state open --json number --jq 'length')
+# Always go to the repo's forge for PRs / issues (project of record).
+# Dispatch on the registry repo URL host: GitHub via gh, Azure DevOps via az.
+case "{repo}" in
+  *dev.azure.com*)
+    # Locate az. Git Bash does not put the Azure CLI on PATH by default.
+    AZ_BIN=$(command -v az 2>/dev/null || true)
+    if [ -z "$AZ_BIN" ] && [ -x "/c/Program Files/Microsoft SDKs/Azure/CLI2/wbin/az" ]; then
+      AZ_BIN="/c/Program Files/Microsoft SDKs/Azure/CLI2/wbin/az"
+    fi
+    if [ -n "$AZ_BIN" ]; then
+      # Repo URL shape: [scheme://][user@]dev.azure.com/{org}/{project}/_git/{repository}
+      AZ_URL=$(printf '%s' "{repo}" | sed -E 's#^[a-zA-Z]+://##; s#^[^@/]+@##; s#^dev\.azure\.com/##; s#^([^/]+)/([^/]+)/_git/(.+)$#\1 \2 \3#')
+      AZ_ORG=$(printf '%s' "$AZ_URL" | cut -d' ' -f1)
+      AZ_PROJECT=$(printf '%s' "$AZ_URL" | cut -d' ' -f2)
+      AZ_REPO=$(printf '%s' "$AZ_URL" | cut -d' ' -f3)
+      PRS=$("$AZ_BIN" repos pr list --org "https://dev.azure.com/$AZ_ORG" \
+        --project "$AZ_PROJECT" --repository "$AZ_REPO" \
+        --status active --query 'length([])' -o tsv 2>/dev/null) || PRS="?"
+      # Azure Boards work items are project-scoped, not repo-scoped. Show a
+      # dash per repo; add one project-wide count to the summary line instead.
+      ISSUES="—"
+      AZ_OPEN_WI=$("$AZ_BIN" boards query --org "https://dev.azure.com/$AZ_ORG" \
+        --project "$AZ_PROJECT" \
+        --wiql "SELECT [System.Id] FROM WorkItems WHERE [System.State] NOT IN ('Closed','Done','Removed')" \
+        --query 'length([])' -o tsv 2>/dev/null) || AZ_OPEN_WI=""
+    else
+      PRS="?"; ISSUES="?"
+      echo "⚠ az CLI not found — cannot query Azure DevOps for {repo}" >&2
+    fi
+    ;;
+  *)
+    PRS=$(gh -R {repo} pr list --state open --json number --jq 'length')
+    ISSUES=$(gh -R {repo} issue list --state open --json number --jq 'length')
+    ;;
+esac
 ```
 
 If `apexyard.projects.yaml` doesn't exist at the ops-repo root, print a clear error pointing the user at `apexyard.projects.yaml.example` and `docs/multi-project.md` for the setup guide.
@@ -82,6 +114,12 @@ After the table, a summary line:
 
 ```
 3 projects · 4 open PRs · 21 open issues · 1 dirty workspace
+```
+
+When Azure DevOps projects are registered, per-repo issues are `—`. Append one project-wide figure instead, sourced from `AZ_OPEN_WI`:
+
+```
+… · 128 open Azure Boards work items (project-wide)
 ```
 
 And, if relevant, flag rows that need attention:
@@ -108,13 +146,15 @@ And, if relevant, flag rows that need attention:
 | No `apexyard.projects.yaml` at the ops-repo root | Print a clear error and a sample registry to copy |
 | Project listed but workspace path missing | Show row with `(not cloned)` — don't fail |
 | `gh` not authenticated | Show row with `?` for PRs/issues — don't fail |
+| Azure DevOps repo but `az` not found or auth failed | Show row with `?` for PRs/issues and a warning line — don't fail |
+| Azure DevOps repo, Issues column | Show `—`; Boards work items are project-scoped, not repo-scoped. Add one project-wide open work-item count to the summary line instead |
 | `repo` field looks invalid | Skip with a warning, continue with the rest |
 
 ## Rules
 
 1. **Registry-driven** — the registry is the source of truth; no discovery fallback
-2. **Source of truth for PRs/issues = GitHub** — never read from a stale local file
-3. **Source of truth for branch state = local workspace** — `gh` doesn't know about your dirty files
+2. **Source of truth for PRs/issues = the repo's forge** (GitHub via `gh`, Azure DevOps via `az`) — never read from a stale local file
+3. **Source of truth for branch state = local workspace** — the forge doesn't know about your dirty files
 4. **Don't silently fail on a missing project** — show the row, mark the gap
 5. **Sort by status then name** — active first, then handover, then paused, then archived
 6. **Never modify the registry from this skill** — read-only
